@@ -1,7 +1,8 @@
-# 设备维修记录 BM25 精确检索
+# 设备维修记录 BM25 精确检索与症状证据简报
 
 面向设备维护工程师的故障处理办法检索服务:FastAPI + NumPy 实现精确 BM25,
 正式检索使用 BlockMax WAND 块上界剪枝(不全量计分后排序),前 k 与穷举完全一致。
+另提供维修主管使用的症状证据简报:从现存维修记录中自动选出覆盖症状词最多的原句。
 
 ## 快速启动
 
@@ -74,6 +75,66 @@ uvicorn app.main:app --port 8000
 全量计分后排序的对照接口,响应结构相同,`scored` 恒为全库篇数 N。
 用于核对正式检索的前 k 一致性,不是正式检索路径。
 
+### `POST /briefings` — 发布症状证据简报
+
+维修主管提交引用记录、症状词与人工标注,服务自动选句并发布(仅保留最近一份)。
+
+```json
+{
+  "record_ids": ["R0001", "R0002"],
+  "terms": ["轴承", "漏油"],
+  "annotations": [
+    {"record_id": "R0001", "sentence_index": 0, "term": "轴承", "polarity": "positive"},
+    {"record_id": "R0001", "sentence_index": 1, "term": "漏油", "polarity": "negative"},
+    {"record_id": "R0002", "sentence_index": 0, "term": "轴承", "polarity": "negative"}
+  ]
+}
+```
+
+请求约束(违反返回 `422`,旧简报不受影响):
+
+- `record_ids`:2~4 个**现存**记录编号,不可重复。
+- `terms`:1~8 个症状词,不可重复。
+- `annotations`:1~18 条人工标注;`sentence_index` 为按 `。!？` 切分后的原句序号(**从 0 起**),
+  标注 `record_id` 必须在 `record_ids` 中、`term` 必须在 `terms` 中且出现在该原句里,
+  序号越界同样 `422`。`polarity` 取 `positive`(肯定)/ `negative`(否定)。
+
+选句规则:
+
+- 原句按全角 `。!？` 切分,标点附在句末、跳过空段;只有被标注引用的原句才是候选。
+- 选**至多 4 句**、**总字符数(含标点)不超过 180**,使覆盖的症状词最多。
+- 同一词同时有肯定与否定标注(冲突词)时,须**各选一句**带对应极性的原句才算覆盖;
+  未满足的词进入 `uncovered`。完全没有标注的症状词也算未覆盖。
+- 覆盖数相同时先取总字符更少的;再相同则取 `(来源编号, 句序)` 升序序列字典序最小者。
+- 候选句全部超 180 字符等导致**无句可选**时返回 `409`,本次拒绝且不替换旧简报。
+
+响应(201)与 `GET /briefings/current` 同构:
+
+```json
+{
+  "published_at": "2026-11-18T21:19:44.346535Z",
+  "expired": false,
+  "record_ids": ["R0001", "R0002"],
+  "terms": ["轴承", "漏油"],
+  "conflicts": ["轴承"],
+  "uncovered": [],
+  "sentences": [
+    {"record_id": "R0001", "sentence_index": 0, "sentence": "轴承过热明显,电机异响！"}
+  ]
+}
+```
+
+### `GET /briefings/current` — 读取最近一份简报
+
+- 只保留最近发布的一份;从未发布返回 `404`。
+- `sentences` 给出原句快照、出处(`record_id` + `sentence_index`);`conflicts` 为肯否冲突词,
+  `uncovered` 为未完全覆盖的词,`expired` 为过期状态。
+- **过期规则**:任一引用记录被更正或删除,简报即置为过期且**永久不可恢复**——
+  同号重录(即使内容改回原文)也不恢复;更正无关记录不影响;容量超限等失败更正不产生过期。
+- 过期后读取仍返回**发布时的原句快照**,正文不随后续更正变化,仅以 `expired: true` 标识。
+- 选句过程不持索引写锁,不阻塞记录更正;若引用记录在发布前已变化,
+  本次发布返回 `409` 且不替换旧简报(乐观并发,基于不可变 State 引用判定)。
+
 ### 其他
 
 - `GET /stats`:篇数、平均长度、词项数、BM25 参数。
@@ -90,7 +151,7 @@ uvicorn app.main:app --port 8000
 ## 验证
 
 ```bash
-python3 -m pytest tests/ -q     # 23 项单元/API/并发测试
+python3 -m pytest tests/ -q     # 单元/API/并发测试(含简报选句与过期语义)
 python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 ```
 
@@ -106,11 +167,12 @@ python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 ## 目录
 
 ```
-app/index.py      BM25 状态构建、BlockMax WAND、穷举对照、原子状态管理
-app/main.py       FastAPI 应用与端点
+app/briefing.py  症状证据简报:原句切分、标注校验、选句优化、过期与并发控制
+app/index.py      BM25 状态构建、BlockMax WAND、穷举对照、原子状态管理、提交回调
+app/main.py       FastAPI 应用与端点(检索 + 简报)
 app/schemas.py    请求/响应模型
 data/corpus.json  本地示例语料(scripts/gen_corpus.py 生成,确定性种子)
 scripts/verify.py 穷举对照与剪枝效果验证
 scripts/load_corpus.py 向运行中的服务批量写入语料
-tests/            单元、API 与并发一致性测试
+tests/            单元、API 与并发一致性测试(含简报)
 ```

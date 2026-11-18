@@ -236,6 +236,15 @@ class IndexManager:
         self._state = build_state({})
         self._lock = threading.Lock()
         self._build_delay = build_delay  # 模拟慢建索引(演示/测试用),秒
+        self._commit_listeners: list = []  # 提交成功回调,参数为本批触及的编号集合
+
+    def add_commit_listener(self, fn) -> None:
+        """登记提交回调:每次成功更正后在写锁内调用 fn(changed_id_set)。
+
+        回调须快速、不得取与写锁构成环路的其他锁(本服务锁序为写锁 -> 简报锁)。
+        构建失败不提交,因此不会触发回调。
+        """
+        self._commit_listeners.append(fn)
 
     def current(self) -> State:
         return self._state
@@ -247,7 +256,8 @@ class IndexManager:
         成功返回 (新 State, 实际删除篇数);失败抛异常,当前状态不变。
         """
         with self._lock:
-            docs = dict(self._state.docs)
+            old_docs = self._state.docs
+            docs = dict(old_docs)
             deleted = 0
             for did in deletes:
                 if docs.pop(did, None) is not None:
@@ -258,6 +268,10 @@ class IndexManager:
                 raise CapacityError(f"更正后总篇数 {len(docs)} 超过上限 {MAX_DOCS},本批未生效")
             new_state = self._build(docs)
             self._state = new_state  # 原子切换:之后的新查询使用新状态
+            # 本批实际触及的编号(去重);同号重录也在集合内,据此使简报永久过期
+            changed = set(deletes) | {did for did, _, _ in upserts}
+            for fn in self._commit_listeners:
+                fn(changed)
             return new_state, deleted
 
     def _build(self, docs: dict) -> State:
